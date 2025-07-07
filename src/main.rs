@@ -5,11 +5,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, Me};
+use teloxide::types::{InputFile};
+use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use zip::ZipWriter;
 use zip::write::FileOptions;
+
+pub const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION"));
 
 #[tokio::main]
 async fn main() {
@@ -20,9 +23,24 @@ async fn main() {
     let bot = Config::from_env().into_bot();
     log::info!("链接成功");
 
+    log::info!("开始注册命令");
+
+    if let Err(why) = bot.set_my_commands(Command::bot_commands()).await {
+        log::error!("无法注册命令: {}", why);
+    } else {
+        log::info!("命令注册成功");
+    }
+
     let client = Client::new();
     let state: AppState = Arc::new(Mutex::new(HashMap::new()));
-    let handler = dptree::entry().branch(Update::filter_message().endpoint(handle_message));
+
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter_command::<Command>()
+                .endpoint(command_handler),
+        )
+        .branch(Update::filter_message().endpoint(handle_message));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![client, state])
@@ -57,41 +75,28 @@ struct UserState {
     messages: Vec<Message>,
 }
 
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase")]
+enum Command {
+    #[command(description = "显示此帮助信息")]
+    Start,
+    #[command(description = "显示此帮助信息")]
+    Help,
+    #[command(description = "开始收集图片信息")]
+    StartCollect,
+    #[command(description = "停止收集并打包下载所有图片")]
+    StopCollect,
+    #[command(description = "显示程序版本")]
+    Version,
+}
+
 /// 消息处理函数
+/// 处理用户的收集消息，如果用户没有开启收集模式，则忽略。
 async fn handle_message(
-    bot: Bot,
     msg: Message,
-    client: Client,
     state: AppState,
-    me: Me,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id;
-    let bot = Arc::new(bot);
-    if let Some(text) = msg.text() {
-        let bot_name = me.username();
-        match text {
-            "/start" | "/help" | "?" => {
-                bot.send_message(chat_id, "你好！我是图片下载机器人。\n\n使用`/StartCollect`开始收集图片，使用`/StopCollect`停止并打包下载".to_string()).await?;
-                return Ok(());
-            }
-            cmd if cmd == "/StartCollect" || cmd == format!("/StartCollect@{}", bot_name) => {
-                start_collecting(Arc::clone(&bot), chat_id, state).await?;
-                return Ok(());
-            }
-            cmd if cmd == "/StopCollect" || cmd == format!("/StopCollect@{}", bot_name) => {
-                tokio::spawn(stop_collecting_and_process(
-                    Arc::clone(&bot),
-                    chat_id,
-                    state,
-                    client,
-                ));
-                return Ok(());
-            }
-            _ => {
-                //其它内容，不解析
-            }
-        }
-    }
 
     let mut state_guard = state.lock().await;
     let user_state = state_guard.entry(chat_id).or_default();
@@ -99,6 +104,36 @@ async fn handle_message(
     if user_state.is_collecting {
         log::trace!("用户 {} 有一个收集会话 {}", chat_id, msg.id);
         user_state.messages.push(msg.clone());
+    }
+
+    Ok(())
+}
+
+/// 命令处理函数
+async fn command_handler(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    client: Client,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let chat_id = msg.chat.id;
+    let bot = Arc::new(bot);
+
+    match cmd {
+        Command::Start | Command::Help => {
+            bot.send_message(chat_id, "你好！我是图片下载机器人。\n\n/startcollect - 开始收集图片\n/stopcollect - 停止并打包下载").await?;
+        }
+        Command::StartCollect => {
+            start_collecting(bot, chat_id, state).await?;
+        }
+        Command::StopCollect => {
+            // 耗时任务放入后台执行
+            tokio::spawn(stop_collecting_and_process(bot, chat_id, state, client));
+        }
+        Command::Version => {
+            bot.send_message(chat_id, format!("当前版本：{}", VERSION)).await?;
+        }
     }
 
     Ok(())
@@ -149,7 +184,7 @@ async fn process_inner(
         let user_state = state_guard.entry(chat_id).or_default();
 
         if !user_state.is_collecting {
-            bot.send_message(chat_id, "🤔 你还没有开始收集，请先发送 /StartCollect。")
+            bot.send_message(chat_id, "🤔 你还没有开始收集，请先发送 /startcollect。")
                 .await?;
             return Ok(());
         }
@@ -197,7 +232,7 @@ async fn process_inner(
     // 2. 创建临时目录并下载图片
     let temp_dir_name = format!("temp_{}_{}", chat_id.0, Uuid::new_v4());
     let temp_dir = PathBuf::from(&temp_dir_name);
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
+    let now = chrono::Local::now().format("%Y-%m-%d:%H:%M");
     let zip_filename = format!("images_{}_{}.zip", now, chat_id.0);
     let zip_path = PathBuf::from(&zip_filename);
 
