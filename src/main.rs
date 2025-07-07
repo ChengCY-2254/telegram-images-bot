@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{InputFile};
+use teloxide::types::InputFile;
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -71,11 +71,18 @@ type AppState = Arc<Mutex<HashMap<ChatId, UserState>>>;
 
 #[derive(Debug, Default)]
 struct UserState {
+    /// 是否是收集模式
     is_collecting: bool,
+    /// 是否设置文件名
+    is_set_file_name: bool,
+    /// 收集的消息
     messages: Vec<Message>,
+    /// 打包的文件名
+    file_name: Option<String>,
 }
 
 #[derive(BotCommands, Clone)]
+//如果不采用小写，telegram就无法注册命令
 #[command(rename_rule = "lowercase")]
 enum Command {
     #[command(description = "显示此帮助信息")]
@@ -88,11 +95,14 @@ enum Command {
     StopCollect,
     #[command(description = "显示程序版本")]
     Version,
+    #[command(description = "设置zip名称")]
+    FileName,
 }
 
 /// 消息处理函数
 /// 处理用户的收集消息，如果用户没有开启收集模式，则忽略。
 async fn handle_message(
+    bot: Bot,
     msg: Message,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -104,6 +114,26 @@ async fn handle_message(
     if user_state.is_collecting {
         log::trace!("用户 {} 有一个收集会话 {}", chat_id, msg.id);
         user_state.messages.push(msg.clone());
+    } else if user_state.is_set_file_name {
+        log::trace!("用户 {} 有一个设置文件名会话 {}", chat_id, msg.id);
+        let file_name = msg.text().unwrap_or_default().to_string();
+
+        if file_name.is_empty() {
+            bot.send_message(chat_id, "❌ 文件名不能为空").await?;
+            return Ok(());
+        }
+
+        user_state.file_name = Some(file_name);
+        bot.send_message(
+            chat_id,
+            format!(
+                "✅已设置文件名为 {}.zip",
+                user_state.file_name.as_ref().unwrap()
+            ),
+        )
+        .await?;
+        // 停止设置文件名会话
+        user_state.is_set_file_name = false;
     }
 
     Ok(())
@@ -122,7 +152,7 @@ async fn command_handler(
 
     match cmd {
         Command::Start | Command::Help => {
-            bot.send_message(chat_id, "你好！我是图片下载机器人。\n\n/startcollect - 开始收集图片\n/stopcollect - 停止并打包下载").await?;
+            bot.send_message(chat_id, "你好！我是图片下载机器人。\n\n/startcollect - 开始收集图片\n/stopcollect - 停止并打包下载\n/filename - 设置文件名称").await?;
         }
         Command::StartCollect => {
             start_collecting(bot, chat_id, state).await?;
@@ -132,9 +162,23 @@ async fn command_handler(
             tokio::spawn(stop_collecting_and_process(bot, chat_id, state, client));
         }
         Command::Version => {
-            bot.send_message(chat_id, format!("当前版本：{}", VERSION)).await?;
+            bot.send_message(chat_id, format!("当前版本：{}", VERSION))
+                .await?;
+        }
+        Command::FileName => {
+            start_set_file_name(bot, chat_id, state).await?;
         }
     }
+
+    Ok(())
+}
+
+async fn start_set_file_name(bot: Arc<Bot>, chat: ChatId, state: AppState)->Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    bot.send_message(chat, "请将文件名发送给我，我会将其设置为压缩包名")
+        .await?;
+    let mut state_guard = state.lock().await;
+    let user_state = state_guard.entry(chat).or_default();
+    user_state.is_set_file_name = true;
 
     Ok(())
 }
@@ -153,7 +197,7 @@ async fn start_collecting(
     log::info!("会话 {} 开启了一个收集任务", chat_id);
     bot.send_message(
         chat_id,
-        "✅收集已开始，请发送图片或包含图片的消息。完成后，发送`/StopCollect`以结束收集",
+        "✅收集已开始，请发送图片或包含图片的消息。完成后，发送/stopcollect以结束收集",
     )
     .await?;
     Ok(())
@@ -179,7 +223,7 @@ async fn process_inner(
     state: AppState,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let messages_to_process = {
+    let (messages_to_process, file_name) = {
         let mut state_guard = state.lock().await;
         let user_state = state_guard.entry(chat_id).or_default();
 
@@ -197,7 +241,9 @@ async fn process_inner(
         );
 
         // 克隆消息列表并释放锁
-        std::mem::take(&mut user_state.messages)
+        let messages = std::mem::take(&mut user_state.messages);
+        let file_name = user_state.file_name.take();
+        (messages, file_name)
     };
 
     if messages_to_process.is_empty() {
@@ -232,8 +278,12 @@ async fn process_inner(
     // 2. 创建临时目录并下载图片
     let temp_dir_name = format!("temp_{}_{}", chat_id.0, Uuid::new_v4());
     let temp_dir = PathBuf::from(&temp_dir_name);
-    let now = chrono::Local::now().format("%Y-%m-%d:%H:%M");
-    let zip_filename = format!("images_{}_{}.zip", now, chat_id.0);
+    let zip_filename = if file_name.is_none() {
+        let now = chrono::Local::now().format("%Y-%m-%d:%H:%M");
+        format!("images_{}_{}.zip", now, chat_id.0)
+    } else {
+        format!("{}.zip", file_name.unwrap())
+    };
     let zip_path = PathBuf::from(&zip_filename);
 
     tokio::fs::create_dir_all(&temp_dir).await?;
