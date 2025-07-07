@@ -1,0 +1,8 @@
+services:
+  telegram-images-bot:
+    build:
+      context: .
+    volumes:
+      - './.env:/app/.env'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
