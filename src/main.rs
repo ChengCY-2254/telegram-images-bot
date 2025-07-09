@@ -45,6 +45,7 @@ async fn main() {
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![client, state])
         .enable_ctrlc_handler()
+        .worker_queue_size(32)
         .build()
         .dispatch()
         .await;
@@ -289,17 +290,18 @@ async fn process_inner(
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     {
-        let mut downloads = Vec::new();
+        let mut downloads = Vec::with_capacity(photo_urls.len());
 
         for (i, url) in photo_urls.clone().into_iter().enumerate() {
             let client = client.clone();
             let temp_dir_cloned = temp_dir.clone(); // 克隆 temp_dir 所有权到异步块内
-            downloads.push(tokio::spawn(async move {
-                let response = client.get(url).send().await.unwrap();
-                let bytes = response.bytes().await.unwrap();
+            downloads.push(async move {
+                let response = client.get(url).send().await?;
+                let bytes = response.bytes().await?;
                 let file_path = temp_dir_cloned.join(format!("image_{}.jpg", i + 1));
-                tokio::fs::write(file_path, &bytes).await.unwrap();
-            }));
+                tokio::fs::write(file_path, &bytes).await?;
+                Ok::<(),Box<dyn std::error::Error+Send+Sync>>(())
+            });
         }
 
         futures::future::join_all(downloads).await;
